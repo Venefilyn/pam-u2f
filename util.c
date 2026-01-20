@@ -988,13 +988,7 @@ static int set_cdh(const cfg_t *cfg, fido_assert_t *assert) {
     return 0;
   }
 
-  if (cfg->webauthn == 1) {
-    debug_dbg(cfg, "Request is WebAuthn origin");
-    r = fido_assert_set_clientdata(assert, cdh, sizeof(cdh));
-  }
-  else {
-    r = fido_assert_set_clientdata_hash(assert, cdh, sizeof(cdh));
-  }
+  r = fido_assert_set_clientdata_hash(assert, cdh, sizeof(cdh));
   if (r != FIDO_OK) {
     debug_dbg(cfg, "Unable to set challenge: %s (%d)", fido_strerr(r), r);
     return 0;
@@ -1047,7 +1041,7 @@ static fido_assert_t *prepare_assert(const cfg_t *cfg, const device_t *device,
     goto err;
   }
 
-  if (!set_cdh(cfg, assert)) {
+  if (!opts->webauthn && !set_cdh(cfg, assert)) {
     debug_dbg(cfg, "Failed to set client data hash");
     goto err;
   }
@@ -1354,20 +1348,24 @@ out:
 #define MAX_PROMPT_LEN (1024)
 
 static int manual_get_assert(const cfg_t *cfg, const char *prompt,
-                             pam_handle_t *pamh, fido_assert_t *assert) {
-  char *b64_cdh = NULL;
-  char *b64_rpid = NULL;
+                             pam_handle_t *pamh, fido_assert_t *assert,
+                             struct opts *opts) {
+  char *b64_cd = NULL;
+  char *rpid = NULL;
   char *b64_authdata = NULL;
   char *b64_sig = NULL;
+  unsigned char *cd = NULL;
   unsigned char *authdata = NULL;
   unsigned char *sig = NULL;
+  size_t cd_len;
   size_t authdata_len;
   size_t sig_len;
   int r;
   int ok = 0;
 
-  b64_cdh = converse(pamh, PAM_PROMPT_ECHO_ON, prompt);
-  b64_rpid = converse(pamh, PAM_PROMPT_ECHO_ON, prompt);
+  b64_cd = converse(pamh, PAM_PROMPT_ECHO_ON, prompt);
+  // TODO: Is rpID base64?? Renamed for now
+  rpid = converse(pamh, PAM_PROMPT_ECHO_ON, prompt);
   b64_authdata = converse(pamh, PAM_PROMPT_ECHO_ON, prompt);
   b64_sig = converse(pamh, PAM_PROMPT_ECHO_ON, prompt);
 
@@ -1379,6 +1377,18 @@ static int manual_get_assert(const cfg_t *cfg, const char *prompt,
   if (!b64_decode(b64_sig, (void **) &sig, &sig_len)) {
     debug_dbg(cfg, "Failed to decode signature");
     goto err;
+  }
+
+  if (opts->webauthn == FIDO_OPT_TRUE) {
+    if (!b64_decode(b64_cd, (void **) &cd, &cd_len)) {
+      debug_dbg(cfg, "Failed to decode signature");
+      goto err;
+    }
+    r = fido_assert_set_clientdata(assert, cd, cd_len);
+    if (r != FIDO_OK) {
+      debug_dbg(cfg, "Failed to set client data");
+      goto err;
+    }
   }
 
   r = fido_assert_set_count(assert, 1);
@@ -1401,8 +1411,8 @@ static int manual_get_assert(const cfg_t *cfg, const char *prompt,
 
   ok = 1;
 err:
-  free(b64_cdh);
-  free(b64_rpid);
+  free(b64_cd);
+  free(rpid);
   free(b64_authdata);
   free(b64_sig);
   free(authdata);
@@ -1415,7 +1425,8 @@ int do_manual_authentication(const cfg_t *cfg, const device_t *devices,
                              const unsigned n_devs, pam_handle_t *pamh) {
   fido_assert_t *assert[n_devs];
   struct pk pk[n_devs];
-  char *b64_challenge = NULL;
+  unsigned char challenge[32];
+  char *b64_challenges[n_devs];
   char prompt[MAX_PROMPT_LEN];
   char buf[MAX_PROMPT_LEN];
   int retval = PAM_AUTH_ERR;
@@ -1425,6 +1436,8 @@ int do_manual_authentication(const cfg_t *cfg, const device_t *devices,
   struct opts opts;
 
   init_opts(&opts);
+  // TODO: Probably want to allocate memory for this. Each challenge is 32B, lets allocate 32B*n_devs somehow?
+  memset(b64_challenges, 0, sizeof(b64_challenges));
   memset(assert, 0, sizeof(assert));
   memset(pk, 0, sizeof(pk));
 
@@ -1451,14 +1464,28 @@ int do_manual_authentication(const cfg_t *cfg, const device_t *devices,
       goto out;
     }
 
-    if (!b64_encode(fido_assert_clientdata_hash_ptr(assert[i]),
-                    fido_assert_clientdata_hash_len(assert[i]),
-                    &b64_challenge)) {
-      debug_dbg(cfg, "Failed to encode challenge");
-      goto out;
+    if (opts->webauthn) {
+
+      if (!random_bytes(challenge, sizeof(challenge))) {
+        debug_dbg(cfg, "Failed to generate challenge");
+        return 0;
+      }
+      // TODO: Does b64_encode also encode it to base64url? That is needed for WebAuthn
+      if (!b64_encode(challenge, sizeof(challenge), &b64_challenges[i])) {
+        debug_dbg(cfg, "Failed to encode challenge");
+        goto out;
+      }
+    }
+    else {
+      if (!b64_encode(fido_assert_clientdata_hash_ptr(assert[i]),
+                      fido_assert_clientdata_hash_len(assert[i]),
+                      &b64_challenge)) {
+        debug_dbg(cfg, "Failed to encode challenge");
+        goto out;
+      }
     }
 
-    debug_dbg(cfg, "Challenge: %s", b64_challenge);
+    debug_dbg(cfg, "Challenge#%u: %s", i + 1, b64_challenges[i]);
 
     n = snprintf(prompt, sizeof(prompt), "Challenge #%u:", i + 1);
     if (n <= 0 || (size_t) n >= sizeof(prompt)) {
@@ -1468,7 +1495,7 @@ int do_manual_authentication(const cfg_t *cfg, const device_t *devices,
 
     converse(pamh, PAM_TEXT_INFO, prompt);
 
-    n = snprintf(buf, sizeof(buf), "%s\n%s\n%s", b64_challenge, cfg->origin,
+    n = snprintf(buf, sizeof(buf), "%s\n%s\n%s", b64_challenges[i], cfg->origin,
                  devices[i].keyHandle);
     if (n <= 0 || (size_t) n >= sizeof(buf)) {
       debug_dbg(cfg, "Failed to print fido2-assert input string");
@@ -1476,9 +1503,6 @@ int do_manual_authentication(const cfg_t *cfg, const device_t *devices,
     }
 
     converse(pamh, PAM_TEXT_INFO, buf);
-
-    free(b64_challenge);
-    b64_challenge = NULL;
   }
 
   converse(pamh, PAM_TEXT_INFO,
@@ -1492,10 +1516,21 @@ int do_manual_authentication(const cfg_t *cfg, const device_t *devices,
       goto out;
     }
 
-    if (!manual_get_assert(cfg, prompt, pamh, assert[i])) {
+    // Technically only need opts->webauthn. We could use cfg->webauthn but we set it
+    if (!manual_get_assert(cfg, prompt, pamh, assert[i], &opts)) {
       debug_dbg(cfg, "Failed to get assert %u", i);
       goto out;
     }
+
+    // TODO: Actively verify challenge in WebAuthn flow
+    // Challenge verification should be added to libfido2.
+    // WebAuthn flow doesn't set clientDataHash (since it can't) and so we don't
+    // get to verify the challenge Something like `fido_assert_set_challenge()`
+    // that can be checked by `fido_assert_verify()`.
+    // `fido_assert_set_clientdata()` can't be done before getting a response but that means
+    // we lose out on challenge verification.
+
+    // TODO: Does fido_assert_verify also verify clientDataJSON? I.e. origin, crossOrigin, type
 
     r = fido_assert_verify(assert[i], 0, pk[i].type, pk[i].ptr);
     if (r == FIDO_OK) {
@@ -1508,9 +1543,11 @@ out:
   for (i = 0; i < n_devs; i++) {
     fido_assert_free(&assert[i]);
     reset_pk(&pk[i]);
+    free(b64_challenges[i]);
   }
 
-  free(b64_challenge);
+  // TODO: Doesn't work atm, but isn't this a memory leak if we don't free the array?
+  // free(b64_challenges);
 
   return retval;
 }
